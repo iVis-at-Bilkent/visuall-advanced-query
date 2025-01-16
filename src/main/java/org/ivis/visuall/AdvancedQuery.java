@@ -1,11 +1,30 @@
 package org.ivis.visuall;
 
-import org.neo4j.graphdb.*;
-import org.neo4j.logging.Log;
-import org.neo4j.procedure.*;
-
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.PriorityQueue;
+import java.util.Queue;
 import java.util.stream.Stream;
+
+import org.neo4j.graphdb.Direction;
+import org.neo4j.graphdb.Entity;
+import org.neo4j.graphdb.GraphDatabaseService;
+import org.neo4j.graphdb.Label;
+import org.neo4j.graphdb.Node;
+import org.neo4j.graphdb.Relationship;
+import org.neo4j.graphdb.RelationshipType;
+import org.neo4j.graphdb.Transaction;
+import org.neo4j.logging.Log;
+import org.neo4j.procedure.Context;
+import org.neo4j.procedure.Description;
+import org.neo4j.procedure.Mode;
+import org.neo4j.procedure.Name;
+import org.neo4j.procedure.Procedure;
 
 public class AdvancedQuery {
     // This field declares that we need a GraphDatabaseService
@@ -179,7 +198,8 @@ public class AdvancedQuery {
      */
     @Procedure(value = "neighborhood", mode = Mode.WRITE)
     @Description("finds the minimal sub-graph from given nodes")
-    public Stream<Output> neighborhood(@Name("elementIds") List<String> elementIds, @Name("ignoredTypes") List<String> ignoredTypes,
+    public Stream<Output> neighborhood(@Name("elementIds") List<String> elementIds,
+            @Name("ignoredTypes") List<String> ignoredTypes,
             @Name("lengthLimit") long lengthLimit, @Name("isDirected") boolean isDirected,
             @Name("pageSize") long pageSize, @Name("currPage") long currPage, @Name("filterTxt") String filterTxt,
             @Name("isIgnoreCase") boolean isIgnoreCase,
@@ -215,6 +235,50 @@ public class AdvancedQuery {
             int toIdx = Math.min(cntSrcNode, (int) (currPage * pageSize));
             this.addSourceNodes(o2, elementIds.subList(fromIdx, toIdx));
         }
+        return Stream.of(o2);
+    }
+
+    /**
+     * finds all the paths containing a prefix of a specified segments in pangenome
+     * graph
+     * 
+     * @param sequenceChain ordered chain of sequences that we want to match within
+     *                      the graph
+     * @param maxJumpLength maximum allowed jump length between non-matching
+     *                      segments in the path
+     * @param ignoredTypes  list of strings which are ignored types
+     * @param pageSize      return at maximum this number of nodes, always returns
+     *                      "ids"
+     * @param currPage      which page do yoy want to return
+     * @param filterTxt     filter results by text
+     * @param isIgnoreCase  should ignore case in text filtering?
+     * @param orderBy       order elements by a property
+     * @param orderDir      order direction
+     * @return all maximal paths in the pangenome graph
+     */
+    @Procedure(value = "sequenceChainSearch", mode = Mode.WRITE)
+    @Description("finds all the paths containing a prefix of a specified segments in pangenome graph")
+    public Stream<Output> sequenceChainSearch(@Name("sequenceChain") List<String> sequenceChain,
+            @Name("maxJumpLength") long maxJumpLength, @Name("ignoredTypes") List<String> ignoredTypes,
+            @Name("pageSize") long pageSize, @Name("currPage") long currPage,
+            @Name("filterTxt") String filterTxt, @Name("isIgnoreCase") boolean isIgnoreCase,
+            @Name("orderBy") String orderBy,
+            @Name("orderDir") long orderDir, @Name("timeout") long timeout) throws Exception {
+        long executionStarted = System.nanoTime();
+        TimeChecker timeChecker = new TimeChecker(timeout);
+        BFSOutput o1 = findSequenceChain(sequenceChain, (int) maxJumpLength, ignoredTypes, timeChecker);
+        this.endMeasuringTime("Sequence chain search", executionStarted);
+        // Convert the BFSOutput to Output
+        Output o2 = new Output();
+        o2.nodes = new ArrayList<>();
+        for (String nodeId : o1.nodes) {
+            o2.nodes.add(getNodeByElementId(nodeId));
+        }
+        o2.edges = new ArrayList<>();
+        for (String edgeId : o1.edges) {
+            o2.edges.add(getRelationshipByElementId(edgeId));
+        }
+        o2.totalNodeCount = o2.nodes.size();
         return Stream.of(o2);
     }
 
@@ -447,6 +511,208 @@ public class AdvancedQuery {
         return r;
     }
 
+    /**
+     * finds all the paths containing a prefix of a specified segments in pangenome
+     * graph
+     * 
+     * @param sequenceChain ordered chain of sequences that we want to match within
+     *                      the graph
+     * @param maxJumpLength maximum allowed jump length between non-matching
+     *                      segments in the path
+     * @param ignoredTypes  list of strings which are ignored types
+     * @param isDirected    is directed?
+     * @param timeChecker   time checker
+     * @return all maximal paths in the pangenome graph as BFSOutput
+     */
+    private BFSOutput findSequenceChain(List<String> sequenceChain, int maxJumpLength, List<String> ignoredTypes,
+            TimeChecker timeChecker) throws Exception {
+        // First find the segment nodes that contain the first sequence by searching the
+        // whole graph
+        HashSet<String> seedSequenceSegments = new HashSet<>();
+
+        try (Transaction tx = db.beginTx()) {
+            for (Node n : tx.getAllNodes()) {
+                if (n.hasProperty("segmentData") &&
+                        n.getProperty("segmentData").toString().contains(
+                                sequenceChain.get(0))) {
+
+                    seedSequenceSegments.add(n.getElementId());
+                }
+            }
+        }
+
+        // Initialize the resulting path set empty
+        BFSOutput r = new BFSOutput(new HashSet<>(), new HashSet<>());
+
+        // For each seed sequence segment, find the paths that contain the rest of
+        // the sequences in the sequence chain
+        for (String seedSequenceSegment : seedSequenceSegments) {
+            // Merge the resulting paths with the paths found for the current seed sequence
+            // segment
+            BFSOutput o = findSequenceChainFromSeed(seedSequenceSegment, sequenceChain,
+                    maxJumpLength, ignoredTypes,
+                    timeChecker);
+
+            // Merge the resulting paths with the paths found for the current seed sequence
+            // TODO CHECK WHETHER O CONTAINS ANY EDGES OR NOT
+            for (String edgeId : o.edges) {
+                Relationship e = getRelationshipByElementId(edgeId);
+            }
+
+            // Merge the resulting paths with the paths found for the current seed sequence
+            // o U r
+            r.nodes.addAll(o.nodes);
+            r.edges.addAll(o.edges);
+        }
+
+        return r; // return the resulting path set
+
+    }
+
+    /**
+     * Finds the paths that contain the rest of the sequences in the sequence chain
+     * starting from the given seed sequence segment.
+     * 
+     * @param seedSequenceSegment the seed sequence segment to start the search from
+     * @param sequenceChain       the sequence chain to search for
+     * @param maxJumpLength       maximum allowed jump length between non-matching
+     *                            segments in the path
+     * @param ignoredTypes        list of strings which are ignored types
+     * @param timeChecker         time checker
+     * 
+     * @return all maximal paths in the pangenome graph as BFSOutput given the seed
+     *         sequence segment
+     */
+    private BFSOutput findSequenceChainFromSeed(String seedSequenceSegment, List<String> sequenceChain,
+            int maxJumpLength, List<String> ignoredTypes, TimeChecker timeChecker) throws Exception {
+        // Initialize explored set to keep track of visited nodes
+        HashSet<String> explored = new HashSet<>();
+
+        // Create a local class for priority queue elements
+        class PQElement implements Comparable<PQElement> {
+            String nodeElementId;
+            int sequenceChainIndex; // used as the priority of items (lower values are higher priority) in the
+                                    // queue, keeps the index of the last specified sequence that we matched so far
+                                    // during our traversal
+            int segmentDataSequenceIndex;
+            int currentJumpLength; // gap count where nodes on the path do not contain any of the sequence from the
+                                   // chain currently being searched
+            List<String> path; // list of node element ids that form the path
+
+            public PQElement(String nodeElementId,
+                    int sequenceChainIndex,
+                    int segmentDataSequenceIndex,
+                    int currentJumpLength, List<String> path) {
+                this.nodeElementId = nodeElementId;
+                this.sequenceChainIndex = sequenceChainIndex;
+                this.segmentDataSequenceIndex = segmentDataSequenceIndex;
+                this.currentJumpLength = currentJumpLength;
+                this.path = path;
+            }
+
+            @Override
+            public int compareTo(PQElement o) {
+                // Compare the priority of two elements in the priority queue based on the
+                // sequence chain index (lower values are higher priority)
+                return Integer.compare(this.sequenceChainIndex, o.sequenceChainIndex);
+            }
+        }
+
+        // Initialize empty priority queue for BFS
+        PriorityQueue<PQElement> pq = new PriorityQueue<>();
+        // Initialize the resulting path set empty
+        BFSOutput r = new BFSOutput(new HashSet<>(), new HashSet<>());
+        // Set the starting seedSequenceSegment visited
+        explored.add(seedSequenceSegment);
+        // Initialize the priority queue with the seed sequence segment with an empty
+        // path(empty list of node element ids)
+        pq.add(new PQElement(seedSequenceSegment, 0, 0, 0, new ArrayList<>()));
+
+        // While the priority queue is not empty
+        while (!pq.isEmpty()) {
+            // Get the element with the highest priority
+            PQElement curr = pq.poll();
+
+            // Check whether the current node contains the sequence from the sequence chain
+            // that we are currently searching for
+            Node n = getNodeByElementId(curr.nodeElementId);
+            String segmentData = n.getProperty("segmentData").toString();
+            int sequenceStartIndex = -1;
+            String sequence = "";
+
+            // Check whether the node contains the sequence starting from the given
+            // segmentDataSequenceIndex in the segmentData as a substring
+            if (curr.sequenceChainIndex < sequenceChain.size()) {
+                sequence = sequenceChain.get((int) curr.sequenceChainIndex);
+                sequenceStartIndex = segmentData.indexOf(sequence, (int) curr.segmentDataSequenceIndex);
+            }
+
+            // If the sequence is found in the segmentData
+            if (sequenceStartIndex >= 0) {
+                // Check whether the current node is the last node in the path to avoid adding
+                // the same node to the path multiple times
+                boolean isLastNodeOfPathCurrentNode = false;
+                if (curr.path.size() > 0) {
+                    isLastNodeOfPathCurrentNode = curr.nodeElementId.equals(curr.path.get(curr.path.size() - 1));
+                }
+
+                // If the current node is not the last node in the path
+                if (!isLastNodeOfPathCurrentNode) {
+                    // Remove the nodes in the path from the resulting path set
+                    r.nodes.removeAll(curr.path);
+
+                    // Add the current node to the path
+                    curr.path.add(curr.nodeElementId);
+
+                    // Add the nodes in the path to the resulting path set
+                    r.nodes.addAll(curr.path);
+                }
+
+                // add current node with next sequence index and segment data index to the queue
+                pq.add(new PQElement(curr.nodeElementId, curr.sequenceChainIndex + 1,
+                        sequenceStartIndex + sequence.length(),
+                        curr.currentJumpLength, new ArrayList<>(curr.path)));
+            } else {
+                // Check whether the current node is the last node in the path to avoid adding
+                // the same node to the path multiple times
+                boolean isLastNodeOfPathCurrentNode = false;
+                if (curr.path.size() > 0) {
+                    isLastNodeOfPathCurrentNode = curr.nodeElementId.equals(curr.path.get(curr.path.size() - 1));
+                }
+
+                // Add the current node to the path
+                if (!isLastNodeOfPathCurrentNode) {
+                    curr.currentJumpLength++;
+                    // Check whether the jump length is less than the maximum allowed jump length
+                    if (curr.currentJumpLength > maxJumpLength) {
+                        continue;
+                    }
+                    curr.path.add(curr.nodeElementId);
+                }
+
+                // Loop through the outgoing neighbors of the current node
+                for (Relationship e : n.getRelationships(Direction.OUTGOING)) {
+                    Node neighbor = e.getEndNode();
+                    String neighborElementId = neighbor.getElementId();
+
+                    // Check whether the neighbor node is not visited
+                    if (!explored.contains(neighborElementId)) {
+                        // Add the neighbor node to the visited set
+                        explored.add(neighborElementId);
+
+                        // Add the neighbor node with the current sequence chain index and segment data
+                        // index to the queue
+                        pq.add(new PQElement(neighborElementId, curr.sequenceChainIndex,
+                                0, curr.currentJumpLength,
+                                new ArrayList<>(curr.path)));
+                    }
+                }
+            }
+        }
+
+        return r; // return the resulting path set
+    }
+
     private void addIfInRange(String elementId, long d1, long d2, long inclusionType, Entity e, List<String> propNames,
             HashSet<String> set) {
         String propStartName = propNames.get(0);
@@ -500,7 +766,8 @@ public class AdvancedQuery {
      * @param isDirected   is directed?
      * @return a set of nodes and edges which is sub-graph
      */
-    private BFSOutput neighborhoodBFS(List<String> elementIds, List<String> ignoredTypes, long lengthLimit, boolean isDirected,
+    private BFSOutput neighborhoodBFS(List<String> elementIds, List<String> ignoredTypes, long lengthLimit,
+            boolean isDirected,
             TimeChecker timeChecker) throws Exception {
         BFSOutput r = new BFSOutput(new HashSet<>(), new HashSet<>());
         HashSet<String> srcNodes = new HashSet<>(elementIds);
@@ -716,7 +983,8 @@ public class AdvancedQuery {
      * @param dir          direction of BFS
      * @return HashSet<Long>
      */
-    private HashSet<String> CS_BFS(HashMap<String, Integer> node2Reached, String nodeElementId, List<String> ignoredTypes,
+    private HashSet<String> CS_BFS(HashMap<String, Integer> node2Reached, String nodeElementId,
+            List<String> ignoredTypes,
             long depthLimit, Direction dir) {
         HashSet<String> visitedNodes = new HashSet<>();
         visitedNodes.add(nodeElementId);
@@ -748,7 +1016,8 @@ public class AdvancedQuery {
                 Node n = e.getOtherNode(curr);
                 String elementId = n.getElementId();
 
-                if ((elementId != nodeElementId && this.isNodeIgnored(n, ignoredTypesSet)) || visitedNodes.contains(elementId)) {
+                if ((elementId != nodeElementId && this.isNodeIgnored(n, ignoredTypesSet))
+                        || visitedNodes.contains(elementId)) {
                     continue;
                 }
 
@@ -926,8 +1195,8 @@ public class AdvancedQuery {
      * graph where each node is
      * at least degree-2 or inside the list of srcIds
      *
-     * @param srcElementIds   element ids of nodes which are sources
-     * @param subGraph current sub-graph which will be modified
+     * @param srcElementIds element ids of nodes which are sources
+     * @param subGraph      current sub-graph which will be modified
      */
     private void purify(HashSet<String> srcElementIds, BFSOutput subGraph) {
         HashMap<String, HashSet<String>> node2edge = new HashMap<>();
