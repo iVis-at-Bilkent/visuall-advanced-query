@@ -535,7 +535,6 @@ public class AdvancedQuery {
                 if (n.hasProperty("segmentData") &&
                         n.getProperty("segmentData").toString().contains(
                                 sequenceChain.get(0))) {
-
                     seedSequenceSegments.add(n.getElementId());
                 }
             }
@@ -554,19 +553,12 @@ public class AdvancedQuery {
                     timeChecker);
 
             // Merge the resulting paths with the paths found for the current seed sequence
-            // TODO CHECK WHETHER O CONTAINS ANY EDGES OR NOT
-            for (String edgeId : o.edges) {
-                Relationship e = getRelationshipByElementId(edgeId);
-            }
-
-            // Merge the resulting paths with the paths found for the current seed sequence
             // o U r
             r.nodes.addAll(o.nodes);
             r.edges.addAll(o.edges);
         }
 
         return r; // return the resulting path set
-
     }
 
     /**
@@ -598,16 +590,18 @@ public class AdvancedQuery {
             int currentJumpLength; // gap count where nodes on the path do not contain any of the sequence from the
                                    // chain currently being searched
             List<String> path; // list of node element ids that form the path
+            List<String> edges; // list of edge element ids that form the path
 
             public PQElement(String nodeElementId,
                     int sequenceChainIndex,
                     int segmentDataSequenceIndex,
-                    int currentJumpLength, List<String> path) {
+                    int currentJumpLength, List<String> path, List<String> edges) {
                 this.nodeElementId = nodeElementId;
                 this.sequenceChainIndex = sequenceChainIndex;
                 this.segmentDataSequenceIndex = segmentDataSequenceIndex;
                 this.currentJumpLength = currentJumpLength;
                 this.path = path;
+                this.edges = edges;
             }
 
             @Override
@@ -621,12 +615,12 @@ public class AdvancedQuery {
         // Initialize empty priority queue for BFS
         PriorityQueue<PQElement> pq = new PriorityQueue<>();
         // Initialize the resulting path set empty
-        BFSOutput r = new BFSOutput(new HashSet<>(), new HashSet<>());
+        BFSOutput r = new BFSOutput(new HashSet<>(), new HashSet<>()); // nodes and edges
         // Set the starting seedSequenceSegment visited
         explored.add(seedSequenceSegment);
         // Initialize the priority queue with the seed sequence segment with an empty
         // path(empty list of node element ids)
-        pq.add(new PQElement(seedSequenceSegment, 0, 0, 0, new ArrayList<>()));
+        pq.add(new PQElement(seedSequenceSegment, 0, 0, 0, new ArrayList<>(), new ArrayList<>()));
 
         // While the priority queue is not empty
         while (!pq.isEmpty()) {
@@ -660,18 +654,20 @@ public class AdvancedQuery {
                 if (!isLastNodeOfPathCurrentNode) {
                     // Remove the nodes in the path from the resulting path set
                     r.nodes.removeAll(curr.path);
+                    r.edges.removeAll(curr.edges);
 
                     // Add the current node to the path
                     curr.path.add(curr.nodeElementId);
 
-                    // Add the nodes in the path to the resulting path set
+                    // Add the nodes and edges in the path to the resulting path set
                     r.nodes.addAll(curr.path);
+                    r.edges.addAll(curr.edges);
                 }
 
                 // add current node with next sequence index and segment data index to the queue
                 pq.add(new PQElement(curr.nodeElementId, curr.sequenceChainIndex + 1,
                         sequenceStartIndex + sequence.length(),
-                        curr.currentJumpLength, new ArrayList<>(curr.path)));
+                        curr.currentJumpLength, new ArrayList<>(curr.path), new ArrayList<>(curr.edges)));
             } else {
                 // Check whether the current node is the last node in the path to avoid adding
                 // the same node to the path multiple times
@@ -700,11 +696,15 @@ public class AdvancedQuery {
                         // Add the neighbor node to the visited set
                         explored.add(neighborElementId);
 
+                        // Add the edge to the path
+                        List<String> newEdges = new ArrayList<>(curr.edges);
+                        newEdges.add(e.getElementId());
+
                         // Add the neighbor node with the current sequence chain index and segment data
                         // index to the queue
                         pq.add(new PQElement(neighborElementId, curr.sequenceChainIndex,
                                 0, curr.currentJumpLength,
-                                new ArrayList<>(curr.path)));
+                                new ArrayList<>(curr.path), newEdges));
                     }
                 }
             }
