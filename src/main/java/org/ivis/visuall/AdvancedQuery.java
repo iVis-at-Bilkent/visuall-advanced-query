@@ -242,31 +242,34 @@ public class AdvancedQuery {
      * finds all the paths containing a prefix of a specified segments in pangenome
      * graph
      * 
-     * @param sequenceChain ordered chain of sequences that we want to match within
-     *                      the graph
-     * @param maxJumpLength maximum allowed jump length between non-matching
-     *                      segments in the path
-     * @param ignoredTypes  list of strings which are ignored types
-     * @param pageSize      return at maximum this number of nodes, always returns
-     *                      "ids"
-     * @param currPage      which page do yoy want to return
-     * @param filterTxt     filter results by text
-     * @param isIgnoreCase  should ignore case in text filtering?
-     * @param orderBy       order elements by a property
-     * @param orderDir      order direction
+     * @param sequenceChain             ordered chain of sequences that we want to
+     *                                  match within
+     *                                  the graph
+     * @param maxJumpLength             maximum allowed jump length between
+     *                                  non-matching
+     *                                  segments in the path
+     * @param minSubsequenceMatchLength minimum length of the match of the
+     *                                  subsequence path length
+     * @param ignoredTypes              list of strings which are ignored types
+     * @param pageSize                  return at maximum this number of nodes,
+     *                                  always returns
+     *                                  "ids"
+     * @param currPage                  which page do yoy want to return
+     * @param timeout                   maximum time to execute the procedure
      * @return all maximal paths in the pangenome graph
      */
     @Procedure(value = "sequenceChainSearch", mode = Mode.WRITE)
     @Description("finds all the paths containing a prefix of a specified segments in pangenome graph")
     public Stream<Output> sequenceChainSearch(@Name("sequenceChain") List<String> sequenceChain,
-            @Name("maxJumpLength") long maxJumpLength, @Name("ignoredTypes") List<String> ignoredTypes,
-            @Name("pageSize") long pageSize, @Name("currPage") long currPage,
-            @Name("filterTxt") String filterTxt, @Name("isIgnoreCase") boolean isIgnoreCase,
-            @Name("orderBy") String orderBy,
-            @Name("orderDir") long orderDir, @Name("timeout") long timeout) throws Exception {
+            @Name("maxJumpLength") long maxJumpLength,
+            @Name("minSubsequenceMatchLength") long minSubsequenceMatchLength,
+            @Name("ignoredTypes") List<String> ignoredTypes,
+            @Name("pageSize") long pageSize, @Name("currPage") long currPage, @Name("timeout") long timeout)
+            throws Exception {
         long executionStarted = System.nanoTime();
         TimeChecker timeChecker = new TimeChecker(timeout);
-        BFSOutput o1 = findSequenceChain(sequenceChain, (int) maxJumpLength, ignoredTypes, timeChecker);
+        BFSOutput o1 = findSequenceChain(sequenceChain, (int) maxJumpLength,
+                (int) minSubsequenceMatchLength, ignoredTypes, timeChecker);
         this.endMeasuringTime("Sequence chain search", executionStarted);
         // Convert the BFSOutput to Output
         Output o2 = new Output();
@@ -524,8 +527,8 @@ public class AdvancedQuery {
      * @param timeChecker   time checker
      * @return all maximal paths in the pangenome graph as BFSOutput
      */
-    private BFSOutput findSequenceChain(List<String> sequenceChain, int maxJumpLength, List<String> ignoredTypes,
-            TimeChecker timeChecker) throws Exception {
+    private BFSOutput findSequenceChain(List<String> sequenceChain, int maxJumpLength,
+            int minSubsequenceMatchLength, List<String> ignoredTypes, TimeChecker timeChecker) throws Exception {
         // First find the segment nodes that contain the first sequence by searching the
         // whole graph
         HashSet<String> seedSequenceSegments = new HashSet<>();
@@ -549,8 +552,7 @@ public class AdvancedQuery {
             // Merge the resulting paths with the paths found for the current seed sequence
             // segment
             BFSOutput o = findSequenceChainFromSeed(seedSequenceSegment, sequenceChain,
-                    maxJumpLength, ignoredTypes,
-                    timeChecker);
+                    maxJumpLength, minSubsequenceMatchLength, ignoredTypes, timeChecker);
 
             // Merge the resulting paths with the paths found for the current seed sequence
             // o U r
@@ -565,18 +567,24 @@ public class AdvancedQuery {
      * Finds the paths that contain the rest of the sequences in the sequence chain
      * starting from the given seed sequence segment.
      * 
-     * @param seedSequenceSegment the seed sequence segment to start the search from
-     * @param sequenceChain       the sequence chain to search for
-     * @param maxJumpLength       maximum allowed jump length between non-matching
-     *                            segments in the path
-     * @param ignoredTypes        list of strings which are ignored types
-     * @param timeChecker         time checker
+     * @param seedSequenceSegment       the seed sequence segment to start the
+     *                                  search from
+     * @param sequenceChain             the sequence chain to search for
+     * @param maxJumpLength             maximum allowed jump length between
+     *                                  non-matching
+     *                                  segments in the path
+     * @param ignoredTypes              list of strings which are ignored types
+     * @param minSubsequenceMatchLength minimum length of the match of the
+     *                                  subsequence
+     *                                  path length
+     * @param timeChecker               time checker
      * 
      * @return all maximal paths in the pangenome graph as BFSOutput given the seed
      *         sequence segment
      */
     private BFSOutput findSequenceChainFromSeed(String seedSequenceSegment, List<String> sequenceChain,
-            int maxJumpLength, List<String> ignoredTypes, TimeChecker timeChecker) throws Exception {
+            int maxJumpLength, int minSubsequenceMatchLength, List<String> ignoredTypes, TimeChecker timeChecker)
+            throws Exception {
         // Initialize explored set to keep track of visited nodes
         HashSet<String> explored = new HashSet<>();
 
@@ -652,16 +660,22 @@ public class AdvancedQuery {
 
                 // If the current node is not the last node in the path
                 if (!isLastNodeOfPathCurrentNode) {
-                    // Remove the nodes in the path from the resulting path set
-                    r.nodes.removeAll(curr.path);
-                    r.edges.removeAll(curr.edges);
+                    // Remove the nodes in the path from the resulting path set if the matched
+                    // subsequences are higher than the minimum subsequence match length
+                    if (curr.sequenceChainIndex + 1 >= minSubsequenceMatchLength) {
+                        r.nodes.removeAll(curr.path);
+                        r.edges.removeAll(curr.edges);
+                    }
 
                     // Add the current node to the path
                     curr.path.add(curr.nodeElementId);
 
-                    // Add the nodes and edges in the path to the resulting path set
-                    r.nodes.addAll(curr.path);
-                    r.edges.addAll(curr.edges);
+                    // Add the nodes and edges in the path to the resulting path set if the matched
+                    // subsequences are higher than the minimum subsequence match length
+                    if (curr.sequenceChainIndex + 1 >= minSubsequenceMatchLength) {
+                        r.nodes.addAll(curr.path);
+                        r.edges.addAll(curr.edges);
+                    }
                 }
 
                 // add current node with next sequence index and segment data index to the queue
@@ -680,7 +694,7 @@ public class AdvancedQuery {
                 if (!isLastNodeOfPathCurrentNode) {
                     curr.currentJumpLength++;
                     // Check whether the jump length is less than the maximum allowed jump length
-                    if (curr.currentJumpLength > maxJumpLength) {
+                    if (curr.currentJumpLength >= maxJumpLength) {
                         continue;
                     }
                     curr.path.add(curr.nodeElementId);
@@ -901,21 +915,21 @@ public class AdvancedQuery {
             nodeLabels.put(elementId, new LabelData(lengthLimit + 1, 0));
         }
 
-        HashSet<String> unignorable = new HashSet<>(resultNodes);
-        unignorable.addAll(s1);
+        HashSet<String> unavoidable = new HashSet<>(resultNodes);
+        unavoidable.addAll(s1);
 
         BFSOutput o1, o2;
         if (d == Direction.OUTGOING) { // means common target
             if (s1.size() < resultNodes.size()) {
                 o1 = GoI_BFS(nodeLabels, edgeLabels, s1, ignoredTypes, lengthLimit, Direction.OUTGOING, true, false,
-                        timeChecker, unignorable);
+                        timeChecker, unavoidable);
                 o2 = GoI_BFS(nodeLabels, edgeLabels, resultNodes, ignoredTypes, lengthLimit, Direction.INCOMING, true,
-                        true, timeChecker, unignorable);
+                        true, timeChecker, unavoidable);
             } else {
                 o2 = GoI_BFS(nodeLabels, edgeLabels, resultNodes, ignoredTypes, lengthLimit, Direction.INCOMING, true,
-                        false, timeChecker, unignorable);
+                        false, timeChecker, unavoidable);
                 o1 = GoI_BFS(nodeLabels, edgeLabels, s1, ignoredTypes, lengthLimit, Direction.OUTGOING, true, true,
-                        timeChecker, unignorable);
+                        timeChecker, unavoidable);
             }
         } else if (d == Direction.INCOMING) { // means common regulator
             for (String elementId : s1) {
@@ -926,26 +940,26 @@ public class AdvancedQuery {
             }
             if (s1.size() < resultNodes.size()) {
                 o1 = GoI_BFS(nodeLabels, edgeLabels, s1, ignoredTypes, lengthLimit, Direction.INCOMING, true, false,
-                        timeChecker, unignorable);
+                        timeChecker, unavoidable);
                 o2 = GoI_BFS(nodeLabels, edgeLabels, resultNodes, ignoredTypes, lengthLimit, Direction.OUTGOING, true,
-                        true, timeChecker, unignorable);
+                        true, timeChecker, unavoidable);
             } else {
                 o2 = GoI_BFS(nodeLabels, edgeLabels, resultNodes, ignoredTypes, lengthLimit, Direction.OUTGOING, true,
-                        false, timeChecker, unignorable);
+                        false, timeChecker, unavoidable);
                 o1 = GoI_BFS(nodeLabels, edgeLabels, s1, ignoredTypes, lengthLimit, Direction.INCOMING, true, true,
-                        timeChecker, unignorable);
+                        timeChecker, unavoidable);
             }
         } else {
             if (s1.size() < resultNodes.size()) {
                 o1 = GoI_BFS(nodeLabels, edgeLabels, s1, ignoredTypes, lengthLimit, Direction.OUTGOING, false, false,
-                        timeChecker, unignorable);
+                        timeChecker, unavoidable);
                 o2 = GoI_BFS(nodeLabels, edgeLabels, resultNodes, ignoredTypes, lengthLimit, Direction.INCOMING, false,
-                        true, timeChecker, unignorable);
+                        true, timeChecker, unavoidable);
             } else {
                 o2 = GoI_BFS(nodeLabels, edgeLabels, resultNodes, ignoredTypes, lengthLimit, Direction.INCOMING, false,
-                        false, timeChecker, unignorable);
+                        false, timeChecker, unavoidable);
                 o1 = GoI_BFS(nodeLabels, edgeLabels, s1, ignoredTypes, lengthLimit, Direction.OUTGOING, false, true,
-                        timeChecker, unignorable);
+                        timeChecker, unavoidable);
             }
         }
 
@@ -1108,7 +1122,7 @@ public class AdvancedQuery {
      */
     private BFSOutput GoI_BFS(HashMap<String, LabelData> nodeLabels, HashMap<String, LabelData> edgeLabels,
             HashSet<String> elementIds, List<String> ignoredTypes, long lengthLimit, Direction dir, boolean isDirected,
-            boolean isFollowLabeled, TimeChecker timeChecker, HashSet<String> unignorable) throws Exception {
+            boolean isFollowLabeled, TimeChecker timeChecker, HashSet<String> unavoidable) throws Exception {
         HashSet<String> nodeSet = new HashSet<>();
         HashSet<String> edgeSet = new HashSet<>();
         HashSet<String> visitedEdges = new HashSet<>();
@@ -1133,7 +1147,7 @@ public class AdvancedQuery {
                 Node n2 = e.getOtherNode(getNodeByElementId(n1));
                 String n2ElementId = n2.getElementId();
                 LabelData labelE = edgeLabels.get(edgeId);
-                boolean isIgnore = !elementIds.contains(n2ElementId) && !unignorable.contains(n2ElementId)
+                boolean isIgnore = !elementIds.contains(n2ElementId) && !unavoidable.contains(n2ElementId)
                         && this.isNodeIgnored(n2, ignoredTypesSet);
                 if (isIgnore || visitedEdges.contains(edgeId) ||
                         (isFollowLabeled && labelE == null)) {
@@ -1384,7 +1398,7 @@ public class AdvancedQuery {
 
     public static class TimeChecker {
         private final long _startTime; // in nano seconds
-        private final long _timeout; // in milli seconds
+        private final long _timeout; // in milliseconds
 
         /**
          * @param timeout maximum allowed duration in milliseconds
