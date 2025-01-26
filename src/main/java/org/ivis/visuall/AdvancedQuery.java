@@ -694,7 +694,7 @@ public class AdvancedQuery {
                 if (!isLastNodeOfPathCurrentNode) {
                     curr.currentJumpLength++;
                     // Check whether the jump length is less than the maximum allowed jump length
-                    if (curr.currentJumpLength >= maxJumpLength) {
+                    if (curr.currentJumpLength > maxJumpLength) {
                         continue;
                     }
                     curr.path.add(curr.nodeElementId);
