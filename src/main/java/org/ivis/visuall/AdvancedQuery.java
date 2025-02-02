@@ -680,8 +680,8 @@ public class AdvancedQuery {
 
                 // add current node with next sequence index and segment data index to the queue
                 pq.add(new PQElement(curr.nodeElementId, curr.sequenceChainIndex + 1,
-                        sequenceStartIndex + sequence.length(),
-                        curr.currentJumpLength, new ArrayList<>(curr.path), new ArrayList<>(curr.edges)));
+                        sequenceStartIndex + sequence.length(), 0, // reset the currentJumpLength after finding a match
+                        new ArrayList<>(curr.path), new ArrayList<>(curr.edges)));
             } else {
                 // Check whether the current node is the last node in the path to avoid adding
                 // the same node to the path multiple times
