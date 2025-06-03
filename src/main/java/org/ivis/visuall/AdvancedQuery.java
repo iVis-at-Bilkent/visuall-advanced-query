@@ -262,29 +262,44 @@ public class AdvancedQuery {
      */
     @Procedure(value = "sequenceChainSearch", mode = Mode.WRITE)
     @Description("finds all the paths containing a prefix of a specified segments in pangenome graph")
-    public Stream<Output> sequenceChainSearch(@Name("sequenceChain") List<String> sequenceChain,
+    public Stream<SequenceChainOutput> sequenceChainSearch(@Name("sequenceChain") List<String> sequenceChain,
             @Name("maxJumpLength") long maxJumpLength,
             @Name("minSubsequenceMatchLength") long minSubsequenceMatchLength,
             @Name("ignoredTypes") List<String> ignoredTypes,
             @Name("pageSize") long pageSize, @Name("currPage") long currPage, @Name("timeout") long timeout)
             throws Exception {
+
         long executionStarted = System.nanoTime();
         TimeChecker timeChecker = new TimeChecker(timeout);
-        BFSOutput o1 = findSequenceChain(sequenceChain, (int) maxJumpLength,
+        HashSet<ArrayList<String>> rawResult = findSequenceChain(sequenceChain, (int) maxJumpLength,
                 (int) minSubsequenceMatchLength, ignoredTypes, timeChecker);
         this.endMeasuringTime("Sequence chain search", executionStarted);
-        // Convert the BFSOutput to Output
-        Output o2 = new Output();
-        o2.nodes = new ArrayList<>();
-        for (String nodeId : o1.nodes) {
-            o2.nodes.add(getNodeByElementId(nodeId));
+
+        Output result = new Output();
+
+        for (ArrayList<String> path : rawResult) {
+            for (int i = 0; i < path.size(); ++i) {
+                if (i % 2 == 0) {
+                    Node node = getNodeByElementId(path.get(i));
+                    result.nodes.add(node);
+                    result.nodeElementId.add(path.get(i));
+                    result.nodeClass.add(node.getLabels().iterator().next().name());
+                } else {
+                    Relationship edge = getRelationshipByElementId(path.get(i));
+                    result.edges.add(edge);
+                    result.edgeElementId.add(path.get(i));
+                    result.edgeClass.add(edge.getType().name());
+                    List<String> sourceTarget = new ArrayList<>();
+                    sourceTarget.add(edge.getStartNode().getElementId());
+                    sourceTarget.add(edge.getEndNode().getElementId());
+                    result.edgeSourceTargets.add(sourceTarget);
+                }
+            }
         }
-        o2.edges = new ArrayList<>();
-        for (String edgeId : o1.edges) {
-            o2.edges.add(getRelationshipByElementId(edgeId));
-        }
-        o2.totalNodeCount = o2.nodes.size();
-        return Stream.of(o2);
+
+        SequenceChainOutput newResult = new SequenceChainOutput(result, new ArrayList<>(rawResult));
+
+        return Stream.of(newResult);
     }
 
     /**
@@ -533,7 +548,7 @@ public class AdvancedQuery {
      * @return all maximal paths in the pangenome graph as BFSOutput given the seed
      *         sequence segment
      */
-    private BFSOutput findSequenceChain(List<String> sequenceChain,
+    private HashSet<ArrayList<String>> findSequenceChain(List<String> sequenceChain,
             int maxJumpLength, int minSubsequenceMatchLength, List<String> ignoredTypes, TimeChecker timeChecker)
             throws Exception {
         // Create a local class for priority queue elements
@@ -602,11 +617,8 @@ public class AdvancedQuery {
             }
         }
 
-        // Initialize the resulting path set empty
-        BFSOutput r = new BFSOutput(new HashSet<>(), new HashSet<>());
-        // Initialize empty priority queue for BFS
+        HashSet<ArrayList<String>> result = new HashSet<ArrayList<String>>();
         PriorityQueue<PQElement> pq = new PriorityQueue<>();
-        // Initialize explored set to keep track of visited nodes
         Set<ExploredElement> explored = new HashSet<>();
 
         // First find the segment nodes that contain the first sequence by searching the
@@ -651,14 +663,7 @@ public class AdvancedQuery {
                 }
                 if (!isLastNodeOfPath) {
                     if (currentPqElement.sequenceChainIndex + 1 >= minSubsequenceMatchLength) {
-                        // r.nodes.removeAll(currentPqElement.path);
-                        for (int i = 0; i < currentPqElement.path.size(); ++i) {
-                            if (i % 2 == 0) {
-                                r.nodes.remove((currentPqElement.path.get(i)));
-                            } else {
-                                r.edges.remove(currentPqElement.path.get(i));
-                            }
-                        }
+                        result.remove(currentPqElement.path);
                     }
 
                     // As we have found a match, we can add running jumps to the path
@@ -672,14 +677,7 @@ public class AdvancedQuery {
                     currentPqElement.path.add(currentPqElement.nodeElementId);
 
                     if (currentPqElement.sequenceChainIndex + 1 >= minSubsequenceMatchLength) {
-                        // r.nodes.addAll(currentPqElement.path);
-                        for (int i = 0; i < currentPqElement.path.size(); ++i) {
-                            if (i % 2 == 0) {
-                                r.nodes.add(currentPqElement.path.get(i));
-                            } else {
-                                r.edges.add(currentPqElement.path.get(i));
-                            }
-                        }
+                        result.add(new ArrayList<String>(currentPqElement.path));
                     }
                 }
 
@@ -709,6 +707,13 @@ public class AdvancedQuery {
                 // the path
                 if (!isLastNodeOfPathCurrentNode) {
                     ++currentPqElement.jumpLength;
+                    // This is to avoid adding the same node to the path multiple times
+                    if (currentPqElement.sequenceChainIndex < sequenceChain.size()) {
+                        explored.add(
+                                new ExploredElement(currentPqElement.nodeElementId,
+                                        currentPqElement.sequenceChainIndex));
+
+                    }
                 }
 
                 // Only add if the jump length is less than the maximum allowed jump length
@@ -737,8 +742,7 @@ public class AdvancedQuery {
                 }
             }
         }
-
-        return r; // return the resulting path set
+        return result; // return the resulting path set
     }
 
     private void addIfInRange(String elementId, long d1, long d2, long inclusionType, Entity e, List<String> propNames,
@@ -1352,6 +1356,30 @@ public class AdvancedQuery {
             this.totalNodeCount = o.totalNodeCount;
             this.edgeSourceTargets = o.edgeSourceTargets;
             this.targetRegulatorNodeElementIds = targetRegulatorNodeElementIds;
+        }
+    }
+
+    public static class SequenceChainOutput {
+        public List<Node> nodes;
+        public List<String> nodeClass;
+        public List<String> nodeElementId;
+
+        public List<Relationship> edges;
+        public List<String> edgeClass;
+        public List<String> edgeElementId;
+        public List<List<String>> edgeSourceTargets;
+
+        public List<List<String>> paths;
+
+        SequenceChainOutput(Output output, List<List<String>> paths) {
+            this.nodes = output.nodes;
+            this.edges = output.edges;
+            this.nodeClass = output.nodeClass;
+            this.edgeClass = output.edgeClass;
+            this.nodeElementId = output.nodeElementId;
+            this.edgeElementId = output.edgeElementId;
+            this.edgeSourceTargets = output.edgeSourceTargets;
+            this.paths = paths;
         }
     }
 
