@@ -271,23 +271,23 @@ public class AdvancedQuery {
 
         long executionStarted = System.nanoTime();
         TimeChecker timeChecker = new TimeChecker(timeout);
-        HashSet<ArrayList<String>> rawResult = findSequenceChain(sequenceChain, (int) maxJumpLength,
+        HashSet<SequenceChainPath> rawResult = findSequenceChain(sequenceChain, (int) maxJumpLength,
                 (int) minSubsequenceMatchLength, ignoredTypes, timeChecker);
         this.endMeasuringTime("Sequence chain search", executionStarted);
 
         Output result = new Output();
 
-        for (ArrayList<String> path : rawResult) {
-            for (int i = 0; i < path.size(); ++i) {
+        for (SequenceChainPath path : rawResult) {
+            for (int i = 0; i < path.path.size(); ++i) {
                 if (i % 2 == 0) {
-                    Node node = getNodeByElementId(path.get(i));
+                    Node node = getNodeByElementId(path.path.get(i));
                     result.nodes.add(node);
-                    result.nodeElementId.add(path.get(i));
+                    result.nodeElementId.add(path.path.get(i));
                     result.nodeClass.add(node.getLabels().iterator().next().name());
                 } else {
-                    Relationship edge = getRelationshipByElementId(path.get(i));
+                    Relationship edge = getRelationshipByElementId(path.path.get(i));
                     result.edges.add(edge);
-                    result.edgeElementId.add(path.get(i));
+                    result.edgeElementId.add(path.path.get(i));
                     result.edgeClass.add(edge.getType().name());
                     List<String> sourceTarget = new ArrayList<>();
                     sourceTarget.add(edge.getStartNode().getElementId());
@@ -297,7 +297,14 @@ public class AdvancedQuery {
             }
         }
 
-        SequenceChainOutput newResult = new SequenceChainOutput(result, new ArrayList<>(rawResult));
+        List<List<String>> paths = new ArrayList<>();
+        List<List<List<String>>> indices = new ArrayList<>();
+        for (SequenceChainPath path : rawResult) {
+            paths.add(path.path);
+            indices.add(path.indices);
+        }
+
+        SequenceChainOutput newResult = new SequenceChainOutput(result, paths, indices);
 
         return Stream.of(newResult);
     }
@@ -548,14 +555,17 @@ public class AdvancedQuery {
      * @return all maximal paths in the pangenome graph as BFSOutput given the seed
      *         sequence segment
      */
-    private HashSet<ArrayList<String>> findSequenceChain(List<String> sequenceChain,
+    private HashSet<SequenceChainPath> findSequenceChain(List<String> sequenceChain,
             int maxJumpLength, int minSubsequenceMatchLength, List<String> ignoredTypes, TimeChecker timeChecker)
             throws Exception {
+
         // Create a local class for priority queue elements
         class PQElement implements Comparable<PQElement> {
             String nodeElementId;
             String previousEdgeId;
-            List<String> path; // list of node element ids that form the path
+            SequenceChainPath sequenceChainPath; // list of node element ids that form the path and the indices of the
+                                                 // sequence chain that are matched so far
+                                                 // [[id, index], [id, index], ...]
             List<String> runningJumps; // list of edges that are not part of the path but are used to
                                        // connect the nodes in the path
             int sequenceChainIndex; // used as the priority of items (lower values are higher priority) in the
@@ -565,13 +575,12 @@ public class AdvancedQuery {
             int jumpLength; // jump count where nodes on the path do not contain any of the sequence from
                             // the chain currently being searched
 
-            public PQElement(String nodeElementId, String previousEdgeId, List<String> path, List<String> runningJumps,
-                    int sequenceChainIndex,
-                    int segmentDataSequenceIndex,
-                    int jumpLength) {
+            public PQElement(String nodeElementId, String previousEdgeId, SequenceChainPath sequenceChainPath,
+                    List<String> runningJumps,
+                    int sequenceChainIndex, int segmentDataSequenceIndex, int jumpLength) {
                 this.nodeElementId = nodeElementId;
                 this.previousEdgeId = previousEdgeId;
-                this.path = path;
+                this.sequenceChainPath = sequenceChainPath;
                 this.runningJumps = runningJumps;
                 this.sequenceChainIndex = sequenceChainIndex;
                 this.segmentDataSequenceIndex = segmentDataSequenceIndex;
@@ -617,7 +626,7 @@ public class AdvancedQuery {
             }
         }
 
-        HashSet<ArrayList<String>> result = new HashSet<ArrayList<String>>();
+        HashSet<SequenceChainPath> result = new HashSet<SequenceChainPath>();
         PriorityQueue<PQElement> pq = new PriorityQueue<>();
         Set<ExploredElement> explored = new HashSet<>();
 
@@ -629,7 +638,7 @@ public class AdvancedQuery {
                         n.getProperty("segmentData").toString().contains(
                                 sequenceChain.get(0))) {
                     pq.add(new PQElement(n.getElementId(), "",
-                            new ArrayList<>(), new ArrayList<>(), 0, 0, 0));
+                            new SequenceChainPath(new ArrayList<>(), new ArrayList<>()), new ArrayList<>(), 0, 0, 0));
                 }
             }
         }
@@ -647,8 +656,7 @@ public class AdvancedQuery {
             // segmentDataSequenceIndex in the segmentData as a substring
             Node currentPqNode = getNodeByElementId(currentPqElement.nodeElementId);
             String segmentData = currentPqNode.getProperty("segmentData").toString();
-            int sequenceStartIndex = -1; // This will be used to store the index of the sequence in the
-                                         // segmentData
+            int sequenceStartIndex = -1; // used to store the index of the sequence in the segmentData
             String sequence = sequenceChain.get((int) currentPqElement.sequenceChainIndex);
             sequenceStartIndex = segmentData.indexOf(sequence, (int) currentPqElement.segmentDataSequenceIndex);
 
@@ -657,28 +665,40 @@ public class AdvancedQuery {
                 // Check whether the current node is the last node in the path to avoid adding
                 // the same node to the path multiple times
                 boolean isLastNodeOfPath = false;
-                if (currentPqElement.path.size() > 0) {
+                if (currentPqElement.sequenceChainPath.path.size() > 0) {
                     isLastNodeOfPath = currentPqElement.nodeElementId.equals(
-                            currentPqElement.path.get(currentPqElement.path.size() - 1));
+                            currentPqElement.sequenceChainPath.path
+                                    .get(currentPqElement.sequenceChainPath.path.size() - 1));
                 }
+
+                ArrayList<String> newIndicesPair = new ArrayList<String>();
+                newIndicesPair.add(currentPqNode.getElementId());
+                newIndicesPair.add(Integer.toString(sequenceStartIndex));
+
                 if (!isLastNodeOfPath) {
                     if (currentPqElement.sequenceChainIndex + 1 >= minSubsequenceMatchLength) {
-                        result.remove(currentPqElement.path);
+                        // Remove the current path state
+                        result.remove(new SequenceChainPath(new ArrayList<>(currentPqElement.sequenceChainPath.path),
+                                new ArrayList<>(currentPqElement.sequenceChainPath.indices)));
                     }
 
-                    // As we have found a match, we can add running jumps to the path
-                    currentPqElement.path.addAll(currentPqElement.runningJumps);
+                    // Add running jumps to the path
+                    currentPqElement.sequenceChainPath.path.addAll(currentPqElement.runningJumps);
                     currentPqElement.runningJumps.clear();
 
-                    // Add the current node to the path and the edge that connects it to the path
+                    // Add the current node to the new path
                     if (currentPqElement.previousEdgeId != "") {
-                        currentPqElement.path.add(currentPqElement.previousEdgeId);
+                        currentPqElement.sequenceChainPath.path.add(currentPqElement.previousEdgeId);
                     }
-                    currentPqElement.path.add(currentPqElement.nodeElementId);
+                    currentPqElement.sequenceChainPath.path.add(currentPqElement.nodeElementId);
+
+                    currentPqElement.sequenceChainPath.indices.add(newIndicesPair);
 
                     if (currentPqElement.sequenceChainIndex + 1 >= minSubsequenceMatchLength) {
-                        result.add(new ArrayList<String>(currentPqElement.path));
+                        result.add(currentPqElement.sequenceChainPath);
                     }
+                } else {
+                    currentPqElement.sequenceChainPath.indices.add(newIndicesPair);
                 }
 
                 explored.add(new ExploredElement(currentPqElement.nodeElementId,
@@ -688,7 +708,7 @@ public class AdvancedQuery {
                 pq.add(new PQElement(
                         currentPqElement.nodeElementId,
                         currentPqElement.previousEdgeId,
-                        new ArrayList<>(currentPqElement.path),
+                        currentPqElement.sequenceChainPath,
                         new ArrayList<>(),
                         currentPqElement.sequenceChainIndex + 1,
                         sequenceStartIndex + sequence.length(),
@@ -698,9 +718,10 @@ public class AdvancedQuery {
             // node is the last node in the path
             else {
                 boolean isLastNodeOfPathCurrentNode = false;
-                if (currentPqElement.path.size() > 0) {
+                if (currentPqElement.sequenceChainPath.path.size() > 0) {
                     isLastNodeOfPathCurrentNode = currentPqElement.nodeElementId
-                            .equals(currentPqElement.path.get(currentPqElement.path.size() - 1));
+                            .equals(currentPqElement.sequenceChainPath.path
+                                    .get(currentPqElement.sequenceChainPath.path.size() - 1));
                 }
 
                 // Only increment the jump length if the current node is not the last node in
@@ -712,7 +733,6 @@ public class AdvancedQuery {
                         explored.add(
                                 new ExploredElement(currentPqElement.nodeElementId,
                                         currentPqElement.sequenceChainIndex));
-
                     }
                 }
 
@@ -720,7 +740,6 @@ public class AdvancedQuery {
                 if (currentPqElement.jumpLength <= maxJumpLength) {
                     // Check whether the current node is the last node in the path to avoid adding
                     // the same node to the path multiple times
-
                     if (!isLastNodeOfPathCurrentNode) {
                         // Extend the running jumps to the path
                         if (!currentPqElement.runningJumps.contains(currentPqElement.previousEdgeId)) {
@@ -728,12 +747,10 @@ public class AdvancedQuery {
                         }
                         currentPqElement.runningJumps.add(currentPqElement.nodeElementId);
                     }
-
                     for (Relationship currentPqOutgoingEdge : currentPqNode.getRelationships(Direction.OUTGOING)) {
-                        pq.add(new PQElement(currentPqOutgoingEdge
-                                .getEndNode().getElementId(),
+                        pq.add(new PQElement(currentPqOutgoingEdge.getEndNode().getElementId(),
                                 currentPqOutgoingEdge.getElementId(),
-                                new ArrayList<>(currentPqElement.path),
+                                currentPqElement.sequenceChainPath,
                                 new ArrayList<>(currentPqElement.runningJumps),
                                 currentPqElement.sequenceChainIndex,
                                 0,
@@ -742,6 +759,7 @@ public class AdvancedQuery {
                 }
             }
         }
+        
         return result; // return the resulting path set
     }
 
@@ -1370,8 +1388,9 @@ public class AdvancedQuery {
         public List<List<String>> edgeSourceTargets;
 
         public List<List<String>> paths;
+        public List<List<List<String>>> indices;
 
-        SequenceChainOutput(Output output, List<List<String>> paths) {
+        SequenceChainOutput(Output output, List<List<String>> paths, List<List<List<String>>> indices) {
             this.nodes = output.nodes;
             this.edges = output.edges;
             this.nodeClass = output.nodeClass;
@@ -1380,6 +1399,35 @@ public class AdvancedQuery {
             this.edgeElementId = output.edgeElementId;
             this.edgeSourceTargets = output.edgeSourceTargets;
             this.paths = paths;
+            this.indices = indices;
+        }
+    }
+
+    public static class SequenceChainPath {
+        public List<String> path;
+        public List<List<String>> indices;
+
+        public SequenceChainPath(List<String> path, List<List<String>> indices) {
+            this.path = new ArrayList<>(path);
+            this.indices = new ArrayList<>(indices.size());
+            for (List<String> inner : indices) {
+                this.indices.add(new ArrayList<>(inner));
+            }
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o)
+                return true;
+            if (o == null || getClass() != o.getClass())
+                return false;
+            SequenceChainPath that = (SequenceChainPath) o;
+            return Objects.equals(path, that.path) && Objects.equals(indices, that.indices);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(path, indices);
         }
     }
 
