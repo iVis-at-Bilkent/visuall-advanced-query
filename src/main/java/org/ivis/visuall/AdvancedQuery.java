@@ -662,6 +662,10 @@ public class AdvancedQuery {
 
             // If the sequence is found in the segmentData
             if (sequenceStartIndex >= 0) {
+                SequenceChainPath newSequenceChainPath = new SequenceChainPath(
+                        new ArrayList<>(currentPqElement.sequenceChainPath.path),
+                        new ArrayList<>(currentPqElement.sequenceChainPath.indices));
+
                 // Check whether the current node is the last node in the path to avoid adding
                 // the same node to the path multiple times
                 boolean isLastNodeOfPath = false;
@@ -678,27 +682,28 @@ public class AdvancedQuery {
                 if (!isLastNodeOfPath) {
                     if (currentPqElement.sequenceChainIndex + 1 >= minSubsequenceMatchLength) {
                         // Remove the current path state
-                        result.remove(new SequenceChainPath(new ArrayList<>(currentPqElement.sequenceChainPath.path),
-                                new ArrayList<>(currentPqElement.sequenceChainPath.indices)));
+                        result.remove(newSequenceChainPath);
                     }
 
                     // Add running jumps to the path
-                    currentPqElement.sequenceChainPath.path.addAll(currentPqElement.runningJumps);
+                    newSequenceChainPath.path.addAll(currentPqElement.runningJumps);
                     currentPqElement.runningJumps.clear();
 
                     // Add the current node to the new path
                     if (currentPqElement.previousEdgeId != "") {
-                        currentPqElement.sequenceChainPath.path.add(currentPqElement.previousEdgeId);
+                        newSequenceChainPath.path.add(currentPqElement.previousEdgeId);
                     }
-                    currentPqElement.sequenceChainPath.path.add(currentPqElement.nodeElementId);
+                    newSequenceChainPath.path.add(currentPqElement.nodeElementId);
 
-                    currentPqElement.sequenceChainPath.indices.add(newIndicesPair);
+                    newSequenceChainPath.indices.add(newIndicesPair);
 
                     if (currentPqElement.sequenceChainIndex + 1 >= minSubsequenceMatchLength) {
-                        result.add(currentPqElement.sequenceChainPath);
+                        result.add(newSequenceChainPath);
                     }
                 } else {
-                    currentPqElement.sequenceChainPath.indices.add(newIndicesPair);
+                    result.remove(newSequenceChainPath);
+                    newSequenceChainPath.indices.add(newIndicesPair);
+                    result.add(newSequenceChainPath);
                 }
 
                 explored.add(new ExploredElement(currentPqElement.nodeElementId,
@@ -708,7 +713,7 @@ public class AdvancedQuery {
                 pq.add(new PQElement(
                         currentPqElement.nodeElementId,
                         currentPqElement.previousEdgeId,
-                        currentPqElement.sequenceChainPath,
+                        newSequenceChainPath,
                         new ArrayList<>(),
                         currentPqElement.sequenceChainIndex + 1,
                         sequenceStartIndex + sequence.length(),
@@ -759,7 +764,7 @@ public class AdvancedQuery {
                 }
             }
         }
-        
+
         return result; // return the resulting path set
     }
 
