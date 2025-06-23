@@ -701,9 +701,13 @@ public class AdvancedQuery {
                         result.add(newSequenceChainPath);
                     }
                 } else {
-                    result.remove(newSequenceChainPath);
+                    if (currentPqElement.sequenceChainIndex + 1 >= minSubsequenceMatchLength) {
+                        result.remove(newSequenceChainPath);
+                    }
                     newSequenceChainPath.indices.add(newIndicesPair);
-                    result.add(newSequenceChainPath);
+                    if (currentPqElement.sequenceChainIndex + 1 >= minSubsequenceMatchLength) {
+                        result.add(newSequenceChainPath);
+                    }
                 }
 
                 explored.add(new ExploredElement(currentPqElement.nodeElementId,
