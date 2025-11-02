@@ -9,6 +9,7 @@ import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Queue;
 import java.util.Set;
 import java.util.function.Predicate;
@@ -48,21 +49,19 @@ public class AdvancedQuery {
     }
 
     // ============================================================
-    // =============== UNIFIED 0–1 BFS ENGINE =====================
+    // ====================== CONSTANTS ===========================
     // ============================================================
 
     private static final RelationshipType BTC = RelationshipType.withName("belongs_to_complex");
 
-    private static class BfsResult {
-        Map<String,Integer> bestCost = new HashMap<>();
-        Map<String,String>  prevNode = new HashMap<>();
-        Map<String,String>  prevRel  = new HashMap<>();
-    }
+    // ============================================================
+    // =============== UNIFIED 0–1 COST FUNCTIONS =================
+    // ============================================================
 
     /** Unified step cost used by every refactored procedure. */
     private int edgeCost(Relationship rel, Node to) {
-        if (BTC.name().equals(rel.getType().name())) return 0;  // membership is always 0-cost
-        return isProcessNode(to) ? 0 : 1;                        // real edges: 0 if 'to' is process, else 1
+        if (BTC.name().equals(rel.getType().name())) return 0;   // membership is always 0-cost
+        return isProcessNode(to) ? 0 : 1;                         // real edges: 0 if 'to' is process, else 1
     }
 
     private Node safeGetNode(String elementId) {
@@ -72,9 +71,19 @@ public class AdvancedQuery {
         try { return tx.getRelationshipByElementId(elementId); } catch (Exception e) { return null; }
     }
 
+    // ============================================================
+    // =================== LEGACY 0–1 BFS (kept) ==================
+    // ============================================================
+
+    private static class BfsResult {
+        Map<String,Integer> bestCost = new HashMap<>();
+        Map<String,String>  prevNode = new HashMap<>();
+        Map<String,String>  prevRel  = new HashMap<>();
+    }
+
     /**
-     * 0–1 BFS from one or many sources. Real edges follow realEdgeDir and honor ignoredEdgeTypes (except BTC which is
-     * always traversed in BOTH w/ 0-cost). A node is traversable only if allowNode.test(node) is true.
+     * Legacy 0–1 BFS (single predecessor) — kept for GoI/neighborhood(elementIds) which rely on
+     * a minimal forest rather than all-paths semantics.
      */
     private BfsResult bfs01WithPrev(
             Iterable<String> startIds,
@@ -101,14 +110,19 @@ public class AdvancedQuery {
             int currCost = res.bestCost.get(currId);
             if (currCost > budget) continue;
 
+            // do not expand from blocked nodes (still keep as terminal)
+            if (allowNode != null && !allowNode.test(curr)) {
+                if (tc != null) { try { tc.checkTime(); } catch (Exception ignore) {} }
+                continue;
+            }
+
             // ---- Real edges in requested direction (skip BTC here; handle below) ----
             for (Relationship rel : curr.getRelationships(realEdgeDir)) {
                 String t = rel.getType().name();
-                if (BTC.name().equals(t)) continue;                    // BTC handled separately
+                if (BTC.name().equals(t)) continue;
                 if (ignoredEdgeTypes != null && ignoredEdgeTypes.contains(t)) continue;
 
                 Node nb = rel.getOtherNode(curr);
-                if (allowNode != null && !allowNode.test(nb)) continue;
 
                 String nbId = nb.getElementId();
                 int step = edgeCost(rel, nb);
@@ -127,7 +141,6 @@ public class AdvancedQuery {
             // ---- Membership edges (always BOTH, 0-cost) ----
             for (Relationship r : curr.getRelationships(Direction.BOTH, BTC)) {
                 Node nb = r.getOtherNode(curr);
-                if (allowNode != null && !allowNode.test(nb)) continue;
 
                 String nbId = nb.getElementId();
                 int next = currCost; // 0-cost
@@ -156,7 +169,7 @@ public class AdvancedQuery {
         return bfs01WithPrev(singleton, budget, realEdgeDir, ignoredEdgeTypes, allowNode, null);
     }
 
-    /** Reconstruct exact path src -> dst into keep sets using prev maps. */
+    /** Legacy: reconstruct a single path using predecessor maps. */
     private void reconstructPath(String srcId, String dstId,
                                  BfsResult res,
                                  Set<String> keepNodes,
@@ -165,33 +178,227 @@ public class AdvancedQuery {
         while (walk != null && !walk.equals(srcId)) {
             keepNodes.add(walk);
             String eId = res.prevRel.get(walk);
-            if (eId != null) keepEdges.add(eId);   // do not filter here; traversal already honored ignored-edge set
+            if (eId != null) keepEdges.add(eId);
             walk = res.prevNode.get(walk);
         }
         keepNodes.add(srcId);
     }
 
-    /** Expand membership closure (both directions) into the keep sets. */
-    private void expandMembershipClosureIntoIds(Set<String> keepNodeIds, Set<String> keepEdgeIds) {
-        ArrayDeque<String> q = new ArrayDeque<>();
-        HashSet<String> seen = new HashSet<>();
-        for (String id : new ArrayList<>(keepNodeIds)) if (seen.add(id)) q.add(id);
+    // ============================================================
+    // ============ NEW: ALL‑PATHS DAG (0–1) ENGINE ===============
+    // ============================================================
 
-        while (!q.isEmpty()) {
-            String xId = q.removeFirst();
-            Node x;
-            try { x = tx.getNodeByElementId(xId); } catch (Exception e) { continue; }
-            if (x == null) continue;
+    /** Key for a state in the layered graph: (node, cost). */
+    private static final class StateKey {
+        final String nodeId;
+        final int cost;
+        StateKey(String nodeId, int cost) { this.nodeId = nodeId; this.cost = cost; }
+        @Override public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof StateKey)) return false;
+            StateKey that = (StateKey) o;
+            return cost == that.cost && Objects.equals(nodeId, that.nodeId);
+        }
+        @Override public int hashCode() { return Objects.hash(nodeId, cost); }
+    }
 
-            for (Relationship r : x.getRelationships(Direction.BOTH, BTC)) {
-                String eId = r.getElementId();
-                Node y = r.getOtherNode(x);
-                String yId = y.getElementId();
+    /** Parent link in the all‑paths DAG: previous state + relationship used. */
+    private static final class Parent {
+        final StateKey prev;
+        final String relId;
+        Parent(StateKey prev, String relId) { this.prev = prev; this.relId = relId; }
+    }
 
-                keepEdgeIds.add(eId);
-                if (keepNodeIds.add(yId) && seen.add(yId)) {
-                    q.addLast(yId);
+    /** Compact representation of all paths (within L) from a seed. */
+    private static final class AllPaths {
+        final int L;
+        final Set<StateKey> states = new HashSet<>();
+        final Map<StateKey, List<Parent>> prevs = new HashMap<>();
+        final Set<String> reachableNodes = new HashSet<>();
+        final Set<StateKey> seedStates = new HashSet<>();
+        AllPaths(int L) { this.L = L; }
+    }
+
+    /**
+     * 0–1 BFS over (node, cost) states that records **all predecessors** for each reached state.
+     * - Real edges traverse in `realEdgeDir` and honor `ignoredEdgeTypes` (BTC is excluded here).
+     * - BTC membership edges are always traversed BOTH with cost 0.
+     * - If `allowNode` returns false for a node, it is still marked as reachable but not expanded.
+     */
+    private AllPaths bfsAllPathsStates(
+            Iterable<String> seedIds,
+            long budget,
+            Direction realEdgeDir,
+            Set<String> ignoredEdgeTypes,
+            Predicate<Node> allowNode,
+            TimeChecker tc) {
+
+        int L = (int) Math.max(0, budget);
+        AllPaths ap = new AllPaths(L);
+        ArrayDeque<StateKey> dq = new ArrayDeque<>();
+        HashSet<StateKey> seen = new HashSet<>();
+
+        // initialize seeds
+        for (String s : seedIds) {
+            Node n = safeGetNode(s);
+            if (n == null) continue;
+            StateKey z = new StateKey(s, 0);
+            ap.states.add(z);
+            ap.seedStates.add(z);
+            ap.reachableNodes.add(s);
+            seen.add(z);
+            dq.addFirst(z);
+        }
+
+        while (!dq.isEmpty()) {
+            StateKey cur = dq.removeFirst();
+            Node curr = safeGetNode(cur.nodeId);
+            if (curr == null) continue;
+            if (cur.cost > L) continue;
+
+            // do not expand from blocked nodes (still keep them as terminals)
+            if (allowNode != null && !allowNode.test(curr)) {
+                if (tc != null) { try { tc.checkTime(); } catch (Exception ignore) {} }
+                continue;
+            }
+
+            // ---- Real edges in requested direction (skip BTC; added below) ----
+            for (Relationship rel : curr.getRelationships(realEdgeDir)) {
+                String t = rel.getType().name();
+                if (BTC.name().equals(t)) continue;
+                if (ignoredEdgeTypes != null && ignoredEdgeTypes.contains(t)) continue;
+
+                Node nb = rel.getOtherNode(curr);
+                int step = edgeCost(rel, nb);
+                int nextCost = cur.cost + step;
+                if (nextCost > L) continue;
+
+                String nbId = nb.getElementId();
+                StateKey nxt = new StateKey(nbId, nextCost);
+
+                // Always record parent link (to aggregate all paths)
+                ap.prevs.computeIfAbsent(nxt, k -> new ArrayList<>())
+                        .add(new Parent(cur, rel.getElementId()));
+
+                if (seen.add(nxt)) {
+                    ap.states.add(nxt);
+                    ap.reachableNodes.add(nbId);
+                    if (step == 0) dq.addFirst(nxt); else dq.addLast(nxt);
                 }
+            }
+
+            // ---- Membership edges (BTC) BOTH directions, cost 0 ----
+            for (Relationship r : curr.getRelationships(Direction.BOTH, BTC)) {
+                Node nb = r.getOtherNode(curr);
+                String nbId = nb.getElementId();
+                StateKey nxt = new StateKey(nbId, cur.cost);
+
+                ap.prevs.computeIfAbsent(nxt, k -> new ArrayList<>())
+                        .add(new Parent(cur, r.getElementId()));
+
+                if (seen.add(nxt)) {
+                    ap.states.add(nxt);
+                    ap.reachableNodes.add(nbId);
+                    dq.addFirst(nxt);
+                }
+            }
+
+            if (tc != null) {
+                try { tc.checkTime(); } catch (Exception ignored) { }
+            }
+        }
+        return ap;
+    }
+
+   /** Collect union of edges/nodes on *all* minimal-cost paths from this seed to every node in `targets`. */
+    private void collectAllPathEdgesToTargets(AllPaths ap,
+                                            String seedId,
+                                            Set<String> targets,
+                                            Set<String> keepNodes,
+                                            Set<String> keepEdges) {
+        // 1) Compute minimal cost per node in this AllPaths
+        Map<String, Integer> minCost = new HashMap<>();
+        for (StateKey st : ap.states) {
+            Integer prev = minCost.get(st.nodeId);
+            if (prev == null || st.cost < prev) minCost.put(st.nodeId, st.cost);
+        }
+
+        // 2) Seed the queue only with minimal-cost states for target nodes
+        ArrayDeque<StateKey> q = new ArrayDeque<>();
+        HashSet<StateKey> seen = new HashSet<>();
+        for (StateKey st : ap.states) {
+            Integer c = minCost.get(st.nodeId);
+            if (c != null && targets.contains(st.nodeId) && st.cost == c) {
+                if (seen.add(st)) q.add(st);
+                keepNodes.add(st.nodeId);
+            }
+        }
+
+        // 3) Backtrack along predecessor links (cost never increases)
+        while (!q.isEmpty()) {
+            StateKey cur = q.removeFirst();
+            for (Parent p : ap.prevs.getOrDefault(cur, Collections.emptyList())) {
+                // guard: parent must not have higher cost than the child
+                if (p.prev.cost > cur.cost) continue;
+
+                keepEdges.add(p.relId);
+                keepNodes.add(p.prev.nodeId);
+                if (seen.add(p.prev)) q.addLast(p.prev);
+            }
+        }
+
+        // Ensure the seed is present
+        keepNodes.add(seedId);
+    }
+
+    /** Collect union of edges/nodes on *all* minimal-cost paths from this seed to a single target nodeId. */
+    private void collectAllPathEdgesToSingleTarget(AllPaths ap,
+                                                String seedId,
+                                                String targetNodeId,
+                                                Set<String> keepNodes,
+                                                Set<String> keepEdges) {
+        // 1) Find the minimal cost for this target
+        int best = Integer.MAX_VALUE;
+        for (StateKey st : ap.states) {
+            if (targetNodeId.equals(st.nodeId) && st.cost < best) best = st.cost;
+        }
+        if (best == Integer.MAX_VALUE) return; // unreachable within budget
+
+        // 2) Start only from states at the minimal cost
+        ArrayDeque<StateKey> q = new ArrayDeque<>();
+        HashSet<StateKey> seen = new HashSet<>();
+        for (StateKey st : ap.states) {
+            if (targetNodeId.equals(st.nodeId) && st.cost == best) {
+                if (seen.add(st)) q.add(st);
+                keepNodes.add(st.nodeId);
+            }
+        }
+
+        // 3) Backtrack to seeds without increasing cost
+        while (!q.isEmpty()) {
+            StateKey cur = q.removeFirst();
+            for (Parent p : ap.prevs.getOrDefault(cur, Collections.emptyList())) {
+                if (p.prev.cost > cur.cost) continue;
+
+                keepEdges.add(p.relId);
+                keepNodes.add(p.prev.nodeId);
+                if (seen.add(p.prev)) q.addLast(p.prev);
+            }
+        }
+
+        keepNodes.add(seedId);
+    }
+
+    /** For neighborhood: union of all parent links (everything visited within budget). */
+    private void collectAllEdgesVisited(AllPaths ap,
+                                        Set<String> keepNodes,
+                                        Set<String> keepEdges) {
+        for (Map.Entry<StateKey, List<Parent>> e : ap.prevs.entrySet()) {
+            StateKey to = e.getKey();
+            keepNodes.add(to.nodeId);
+            for (Parent p : e.getValue()) {
+                keepEdges.add(p.relId);
+                keepNodes.add(p.prev.nodeId);
             }
         }
     }
@@ -264,9 +471,9 @@ public class AdvancedQuery {
         return Stream.of(o2);
     }
 
-    // ------------------------ Common Stream ------------------------
+   // ------------------------ Common Stream (ALL PATHS) ------------------------
     @Procedure(value = "commonStream", mode = Mode.WRITE)
-    @Description("From specified nodes forms founds common upstream/downstream (target/regulator) with unified hop cost")
+    @Description("From specified nodes forms common upstream/downstream (target/regulator) with unified hop cost; collects ALL paths to common nodes.")
     public Stream<CommonStreamOutput> commonStream(
             @Name("elementIds") List<String> elementIds,
             @Name("ignoredTypes") List<String> ignoredTypes,
@@ -294,51 +501,63 @@ public class AdvancedQuery {
             return Stream.of(new CommonStreamOutput(o, Collections.emptyList()));
         }
 
-        // 1) BFS from each source
-        List<BfsResult> perSource = new ArrayList<>(elementIds.size());
-        for (String src : elementIds) {
-            perSource.add(bfs01WithPrev(Collections.singletonList(src), lengthLimit, realDir, ignored, n -> true, null));
-        }
-        this.endMeasuringTime("Common stream (BFS per source)", executionStarted);
+        long simpleChemThresholdForCommonStream = Long.MAX_VALUE;
+        Predicate<Node> allowNode = n -> !isBlockedSimpleChemical(n, simpleChemThresholdForCommonStream);
 
-        // 2) Intersection of reachable
-        Set<String> common = new HashSet<>(perSource.get(0).bestCost.keySet());
-        for (int i = 1; i < perSource.size(); i++) common.retainAll(perSource.get(i).bestCost.keySet());
+        // 1) All-paths BFS from each source
+        List<AllPaths> perSource = new ArrayList<>(elementIds.size());
+        for (String src : elementIds) {
+            perSource.add(bfsAllPathsStates(Collections.singletonList(src), lengthLimit, realDir, ignored, allowNode, new TimeChecker(timeout)));
+        }
+        this.endMeasuringTime("Common stream (all-paths BFS per source)", executionStarted);
+
+        // 2) Intersection of reachable nodeIds (common terminals)
+        Set<String> common = new HashSet<>(perSource.get(0).reachableNodes);
+        for (int i = 1; i < perSource.size(); i++) common.retainAll(perSource.get(i).reachableNodes);
         common.removeAll(elementIds);
 
-        // 3) Reconstruct exact paths
+        // 3) Collect ALL edges on minimal-cost paths from each seed to ALL commons
         Set<String> keepNodes = new HashSet<>(elementIds);
         Set<String> keepEdges = new HashSet<>();
-        for (String t : common) {
-            for (int i = 0; i < elementIds.size(); i++) {
-                if (perSource.get(i).bestCost.containsKey(t)) {
-                    reconstructPath(elementIds.get(i), t, perSource.get(i), keepNodes, keepEdges);
-                }
-            }
+        for (int i = 0; i < elementIds.size(); i++) {
+            String seed = elementIds.get(i);
+            collectAllPathEdgesToTargets(perSource.get(i), seed, common, keepNodes, keepEdges);
         }
 
-        // Membership closure (kept behavior) + prune
+        // 4) Membership closure (paths + seeds)
         expandMembershipClosureIntoIds(keepNodes, keepEdges);
-
-        Set<String> protectedNodes = new HashSet<>(elementIds);
-        for (String t : common) {
-            Node tn = getNodeByElementId(t);
-            if (tn != null && !isProcessNode(tn)) protectedNodes.add(t);
+        if (elementIds != null && !elementIds.isEmpty()) {
+            Set<String> seedClosureNodes = new HashSet<>(elementIds);
+            Set<String> seedClosureEdges = new HashSet<>();
+            expandMembershipClosureIntoIds(seedClosureNodes, seedClosureEdges);
+            keepNodes.addAll(seedClosureNodes);
+            keepEdges.addAll(seedClosureEdges);
         }
-        pruneProcessLeafTails(keepNodes, keepEdges, protectedNodes, new HashSet<>(ignored));
 
-        // 4) Date filter → prune again → filtering/pagination
+        // (REMOVED) — no pruning here
+
+        // 5) Date filter (no prune yet)
         BFSOutput base = new BFSOutput(new HashSet<>(keepNodes), new HashSet<>(keepEdges));
-
         long t0 = System.nanoTime();
         BFSOutput filtered = this.filterByDate(base, startTime, endTime, timeMapping, inclusionType);
-        pruneProcessLeafTails(filtered.nodes, filtered.edges, protectedNodes, new HashSet<>(ignored));
-        this.endMeasuringTime("Common stream (filter+prune)", t0);
+        this.endMeasuringTime("Common stream (filter)", t0);
 
-        // 5) Pagination graph: now drop seeds only from nodes (edges stay intact)
+        // 6) Page graph = filtered minus seeds
         BFSOutput pageGraph = new BFSOutput(new HashSet<>(filtered.nodes), new HashSet<>(filtered.edges));
-        pageGraph.nodes.removeAll(elementIds);
+
+        // === NEW: FINAL PRUNE (remove leaf processes after seeds are hidden) ===
+        // Protect seeds and NON-process common nodes. Process commons are allowed to be pruned if they are leaves.
+        Set<String> protectedAtEnd = new HashSet<>(elementIds);
+        for (String t : common) {
+            Node tn = safeGetNode(t);
+            if (tn != null && !isProcessNode(tn)) protectedAtEnd.add(t);
+        }
+        pruneProcessLeafTails(pageGraph.nodes, pageGraph.edges, protectedAtEnd, new HashSet<>(ignored));
         
+        pageGraph.nodes.removeAll(elementIds);
+        // === END NEW ===
+
+        // 7) Table/id filter & pagination
         int cntSrcNode = elementIds.size();
         int cntSkip = Math.max(0, (int) ((currPage - 1) * pageSize) - cntSrcNode);
         long numSrcNode2return = Math.min(pageSize, Math.max(0, cntSrcNode - (currPage - 1) * pageSize));
@@ -358,8 +577,16 @@ public class AdvancedQuery {
             this.addSourceNodes(o2, elementIds.subList(fromIdx, toIdx));
         }
         expandComplexMembersInOutput(o2);
-        return Stream.of(new CommonStreamOutput(o2, new ArrayList<>(common)));
+
+        // Return only commons that survived the final prune
+        List<String> commonForReturn = new ArrayList<>();
+        for (String t : common) {
+            if (pageGraph.nodes.contains(t)) commonForReturn.add(t);
+        }
+
+        return Stream.of(new CommonStreamOutput(o2, commonForReturn));
     }
+
 
     // ------------------------ Neighborhood (elementIds) ------------------------
     @Procedure(value = "neighborhood", mode = Mode.WRITE)
@@ -386,13 +613,12 @@ public class AdvancedQuery {
         Direction realDir = isDirected ? Direction.OUTGOING : Direction.BOTH;
         Set<String> ignored = (ignoredTypes == null) ? Collections.emptySet() : new HashSet<>(ignoredTypes);
 
-        // Multi-source BFS; record prev; union a minimal forest
+        // Keep legacy behavior here (minimal forest via single-predecessor BFS).
         BfsResult res = bfs01WithPrev(elementIds, lengthLimit, realDir, ignored, n -> true, new TimeChecker(timeout));
 
         Set<String> keepNodes = new HashSet<>();
         Set<String> keepEdges = new HashSet<>();
 
-        // Build a forest from prev edges; exclude seeds from node set (added later via pagination)
         HashSet<String> srcSet = new HashSet<>(elementIds);
         for (Map.Entry<String, String> e : res.prevNode.entrySet()) {
             String nbId = e.getKey();
@@ -439,12 +665,10 @@ public class AdvancedQuery {
         return Stream.of(o2);
     }
 
-    // ------------------------ pathsBetween (internal ids) ------------------------
+    // ------------------------ pathsBetween (internal ids, ALL PATHS) ------------------------
     @Procedure(value = "pathsBetween", mode = Mode.READ)
-    @Description("pathsBetween(idList, lengthLimit, cloningThreshold): " +
-            "Undirected paths between any pair of given INTERNAL node ids, " +
-            "blocking high-degree simple_chemical nodes, " +
-            "traversing membership edges at 0-cost, and counting only non-process steps.")
+    @Description("pathsBetween(idList, lengthLimit, cloningThreshold): ALL valid paths between any pair of INTERNAL node ids, " +
+            "blocking high-degree simple_chemical nodes, traversing BTC at 0-cost; unified hop cost.")
     public Stream<PathsBetweenOutput> pathsBetween(
             @Name("idList") List<Long> idList,
             @Name("lengthLimit") long lengthLimit,
@@ -454,12 +678,12 @@ public class AdvancedQuery {
             return Stream.of(new PathsBetweenOutput(Collections.emptyList(), Collections.emptyList(), "HybridAny"));
         }
 
-        // Resolve seeds (skip blocked simple_chemical)
+        // Resolve seeds
         List<Node> seeds = new ArrayList<>();
         for (Long id : idList) {
             if (id == null) continue;
             Node n = getNodeByInternalId(id);
-            if (n != null && !isBlockedSimpleChemical(n, cloningThreshold)) seeds.add(n);
+            if (n != null) seeds.add(n);
         }
         if (seeds.size() < 2) {
             return Stream.of(new PathsBetweenOutput(Collections.emptyList(), Collections.emptyList(), "HybridAny"));
@@ -467,13 +691,13 @@ public class AdvancedQuery {
 
         Set<String> ignored = new HashSet<>(Arrays.asList("belongs_to_compartment", "belongs_to_submap"));
         Direction realDir = Direction.BOTH;
-
-        // Precompute BFS per source (reuse for all pairs)
-        Map<String, BfsResult> bySrc = new HashMap<>();
         Predicate<Node> allowNode = nb -> !isBlockedSimpleChemical(nb, cloningThreshold);
+
+        // Precompute all-paths per source
+        Map<String, AllPaths> bySrc = new HashMap<>();
         for (Node src : seeds) {
             String srcId = src.getElementId();
-            bySrc.put(srcId, bfs01WithPrev(Collections.singletonList(srcId), lengthLimit, realDir, ignored, allowNode, null));
+            bySrc.put(srcId, bfsAllPathsStates(Collections.singletonList(srcId), lengthLimit, realDir, ignored, allowNode, null));
         }
 
         Set<String> keepNodes = new HashSet<>();
@@ -481,22 +705,27 @@ public class AdvancedQuery {
 
         for (int i = 0; i < seeds.size(); i++) {
             String srcId = seeds.get(i).getElementId();
-            BfsResult res = bySrc.get(srcId);
-            if (res == null) continue;
+            AllPaths apSrc = bySrc.get(srcId);
+            if (apSrc == null) continue;
 
             for (int j = i + 1; j < seeds.size(); j++) {
                 String dstId = seeds.get(j).getElementId();
-                Integer cost = res.bestCost.get(dstId);
-                if (cost == null || cost > lengthLimit) continue;
 
-                reconstructPath(srcId, dstId, res, keepNodes, keepEdges);
+                // Try src -> dst
+                if (apSrc.reachableNodes.contains(dstId)) {
+                    collectAllPathEdgesToSingleTarget(apSrc, srcId, dstId, keepNodes, keepEdges);
+                    continue;
+                }
+
+                // Try dst -> src
+                AllPaths apDst = bySrc.get(dstId);
+                if (apDst != null && apDst.reachableNodes.contains(srcId)) {
+                    collectAllPathEdgesToSingleTarget(apDst, dstId, srcId, keepNodes, keepEdges);
+                }
             }
         }
 
-        // Optional: membership closure on result (keep old behavior minimal: path edges only)
-        // expandMembershipClosureIntoIds(keepNodes, keepEdges);
-
-        // Prune process-only tails, protect seed endpoints
+        // Prune process-only tails, protect seed endpoints (keep previous behavior of not expanding membership closure here)
         Set<String> protectedNodes = new HashSet<>();
         for (Node n : seeds) protectedNodes.add(n.getElementId());
         pruneProcessLeafTails(keepNodes, keepEdges, protectedNodes, ignored);
@@ -504,12 +733,11 @@ public class AdvancedQuery {
         // Materialize
         List<Node> outNodes = new ArrayList<>(keepNodes.size());
         for (String id : keepNodes) outNodes.add(getNodeByElementId(id));
-
         List<Relationship> outRels = new ArrayList<>(keepEdges.size());
         for (String id : keepEdges) outRels.add(getRelationshipByElementId(id));
 
         Set<String> langs = new HashSet<>();
-        for (Node n : outNodes) if (n.hasProperty("language")) {
+        for (Node n : outNodes) if (n != null && n.hasProperty("language")) {
             Object lang = n.getProperty("language");
             if (lang != null) langs.add(String.valueOf(lang));
         }
@@ -517,10 +745,9 @@ public class AdvancedQuery {
         return Stream.of(new PathsBetweenOutput(outNodes, outRels, language));
     }
 
-    // ------------------------ pathsFromTo (internal ids) ------------------------
+    // ------------------------ pathsFromTo (internal ids, ALL PATHS) ------------------------
     @Procedure(value = "pathsFromTo", mode = Mode.READ)
-    @Description("pathsFromTo(idList, lengthLimit, simpleChemicalDegreeThreshold): " +
-            "Undirected paths between any two INTERNAL ids, unifying hop cost and membership traversal.")
+    @Description("pathsFromTo(idList, lengthLimit, simpleChemicalDegreeThreshold): ALL valid paths between any two INTERNAL ids; unified hop cost; blocks high-degree simple_chemical nodes.")
     public Stream<PathsBetweenOutput> pathsFromTo(
             @Name("idList") List<Long> idList,
             @Name("lengthLimit") long lengthLimit,
@@ -542,12 +769,12 @@ public class AdvancedQuery {
 
         Set<String> ignored = new HashSet<>(Arrays.asList("belongs_to_compartment", "belongs_to_submap"));
         Direction realDir = Direction.BOTH;
-
-        Map<String, BfsResult> bySrc = new HashMap<>();
         Predicate<Node> allowNode = nb -> !isBlockedSimpleChemical(nb, simpleChemDegThreshold);
+
+        Map<String, AllPaths> bySrc = new HashMap<>();
         for (Node src : seeds) {
             String srcId = src.getElementId();
-            bySrc.put(srcId, bfs01WithPrev(Collections.singletonList(srcId), lengthLimit, realDir, ignored, allowNode, null));
+            bySrc.put(srcId, bfsAllPathsStates(Collections.singletonList(srcId), lengthLimit, realDir, ignored, allowNode, null));
         }
 
         Set<String> keepNodes = new HashSet<>();
@@ -555,15 +782,19 @@ public class AdvancedQuery {
 
         for (int i = 0; i < seeds.size(); i++) {
             String srcId = seeds.get(i).getElementId();
-            BfsResult res = bySrc.get(srcId);
-            if (res == null) continue;
+            AllPaths apSrc = bySrc.get(srcId);
+            if (apSrc == null) continue;
 
             for (int j = i + 1; j < seeds.size(); j++) {
                 String dstId = seeds.get(j).getElementId();
-                Integer cost = res.bestCost.get(dstId);
-                if (cost == null || cost > lengthLimit) continue;
-
-                reconstructPath(srcId, dstId, res, keepNodes, keepEdges);
+                if (apSrc.reachableNodes.contains(dstId)) {
+                    collectAllPathEdgesToSingleTarget(apSrc, srcId, dstId, keepNodes, keepEdges);
+                } else {
+                    AllPaths apDst = bySrc.get(dstId);
+                    if (apDst != null && apDst.reachableNodes.contains(srcId)) {
+                        collectAllPathEdgesToSingleTarget(apDst, dstId, srcId, keepNodes, keepEdges);
+                    }
+                }
             }
         }
 
@@ -577,7 +808,7 @@ public class AdvancedQuery {
         for (String id : keepEdges) outRels.add(getRelationshipByElementId(id));
 
         Set<String> langs = new HashSet<>();
-        for (Node n : outNodes) if (n.hasProperty("language")) {
+        for (Node n : outNodes) if (n != null && n.hasProperty("language")) {
             Object v = n.getProperty("language");
             if (v != null) langs.add(String.valueOf(v));
         }
@@ -585,11 +816,9 @@ public class AdvancedQuery {
         return Stream.of(new PathsBetweenOutput(outNodes, outRels, language));
     }
 
-    // ------------------------ neighborhoodFromIds (internal ids) ------------------------
+    // ------------------------ neighborhoodFromIds (internal ids, ALL PATHS) ------------------------
     @Procedure(value = "neighborhoodFromIds", mode = Mode.READ)
-    @Description("neighborhoodFromIds(idList, lengthLimit, simpleChemicalDegreeThreshold): " +
-            "Undirected neighborhood from INTERNAL ids with unified hop cost (membership 0-cost, real edges 0 to process else 1); " +
-            "blocks high-degree simple_chemical nodes.")
+    @Description("neighborhoodFromIds(idList, lengthLimit, simpleChemicalDegreeThreshold): union of ALL path edges within budget from INTERNAL ids; BTC 0-cost; blocks high-degree simple_chemical nodes.")
     public Stream<PathsBetweenOutput> neighborhoodFromIds(
             @Name("idList") List<Long> idList,
             @Name("lengthLimit") long lengthLimit,
@@ -613,28 +842,18 @@ public class AdvancedQuery {
         Direction realDir = Direction.BOTH;
         Predicate<Node> allowNode = nb -> !isBlockedSimpleChemical(nb, simpleChemDegThreshold);
 
+        // one AllPaths run with all seeds is OK (multi-source)
         List<String> startIds = new ArrayList<>();
         for (Node n : seeds) startIds.add(n.getElementId());
-        BfsResult res = bfs01WithPrev(startIds, lengthLimit, realDir, ignored, allowNode, null);
+        AllPaths ap = bfsAllPathsStates(startIds, lengthLimit, realDir, ignored, allowNode, null);
 
-        // Build forest from prev
+        // Collect union of all parent links
         Set<String> keepNodes = new HashSet<>();
         Set<String> keepEdges = new HashSet<>();
-        HashSet<String> srcSet = new HashSet<>(startIds);
-        for (Map.Entry<String, String> e : res.prevNode.entrySet()) {
-            String nbId = e.getKey();
-            String prev = e.getValue();
-            String relId = res.prevRel.get(nbId);
-            if (relId != null) keepEdges.add(relId);
-            if (!srcSet.contains(nbId)) keepNodes.add(nbId);
-            keepNodes.add(prev);
-        }
-
-        // Optionally expand membership in output
-        // expandMembershipClosureIntoIds(keepNodes, keepEdges);
+        collectAllEdgesVisited(ap, keepNodes, keepEdges);
 
         // Prune protecting seeds
-        Set<String> protectedNodes = new HashSet<>(srcSet);
+        Set<String> protectedNodes = new HashSet<>(startIds);
         pruneProcessLeafTails(keepNodes, keepEdges, protectedNodes, ignored);
 
         List<Node> outNodes = new ArrayList<>(keepNodes.size());
@@ -643,7 +862,7 @@ public class AdvancedQuery {
         for (String id : keepEdges) outRels.add(getRelationshipByElementId(id));
 
         Set<String> langs = new HashSet<>();
-        for (Node n : outNodes) if (n.hasProperty("language")) {
+        for (Node n : outNodes) if (n != null && n.hasProperty("language")) {
             Object v = n.getProperty("language");
             if (v != null) langs.add(String.valueOf(v));
         }
@@ -1217,7 +1436,7 @@ public class AdvancedQuery {
         String cls = n.hasProperty("class") ? String.valueOf(n.getProperty("class")) : "";
         if (!"simple_chemical".equals(cls)) return false;
         int deg = n.getDegree(Direction.BOTH);
-        return deg > cloningThreshold;
+        return deg >= cloningThreshold;
     }
 
     private Node getNodeByInternalId(long internalId) {
@@ -1256,6 +1475,7 @@ public class AdvancedQuery {
         List<List<String>> addEdgeSrcTgt = new ArrayList<>();
 
         for (Node n : r.nodes) {
+            if (n == null) continue;
             if (isComplexNode(n)) {
                 for (Relationship memberRel : n.getRelationships(Direction.INCOMING, BTC)) {
                     Node member = memberRel.getStartNode();
@@ -1444,5 +1664,30 @@ public class AdvancedQuery {
                         || !nodeIds.contains(r.getEndNode().getElementId());
             } catch (Exception ignore) { return true; }
         });
+    }
+
+    /** Expand membership closure (both directions) into the keep sets (BTC semantics kept). */
+    private void expandMembershipClosureIntoIds(Set<String> keepNodeIds, Set<String> keepEdgeIds) {
+        ArrayDeque<String> q = new ArrayDeque<>();
+        HashSet<String> seen = new HashSet<>();
+        for (String id : new ArrayList<>(keepNodeIds)) if (seen.add(id)) q.add(id);
+
+        while (!q.isEmpty()) {
+            String xId = q.removeFirst();
+            Node x;
+            try { x = tx.getNodeByElementId(xId); } catch (Exception e) { continue; }
+            if (x == null) continue;
+
+            for (Relationship r : x.getRelationships(Direction.BOTH, BTC)) {
+                String eId = r.getElementId();
+                Node y = r.getOtherNode(x);
+                String yId = y.getElementId();
+
+                keepEdgeIds.add(eId);
+                if (keepNodeIds.add(yId) && seen.add(yId)) {
+                    q.addLast(yId);
+                }
+            }
+        }
     }
 }
